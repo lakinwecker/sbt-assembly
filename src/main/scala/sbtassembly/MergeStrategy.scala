@@ -50,12 +50,25 @@ sealed trait MergeStrategy extends (Vector[Dependency] => Either[String, Vector[
    * @return if this merge strategy is a built-in/internal instance provided by the plugin
    */
   def isBuiltIn: Boolean = true
+
+  /**
+   * What the assembly cache records about this strategy. A built-in strategy's behaviour is fixed by the plugin
+   * version, so its name is enough. A custom strategy's behaviour lives in a user function the plugin can't inspect,
+   * so it has no cache key unless the user supplies one, and an assembly that uses it is never cached.
+   *
+   * @return the value recorded in the cache key, or `None` if this strategy prevents caching
+   */
+  def cacheKey: Option[String] = Some(name)
 }
 abstract private[sbtassembly] class InternalMergeStrategy(val name: String, val notifyThreshold: Int)
     extends MergeStrategy
-abstract private[sbtassembly] class CustomMergeStrategy(val name: String, val notifyThreshold: Int)
-    extends MergeStrategy {
+abstract private[sbtassembly] class CustomMergeStrategy(
+    val name: String,
+    val notifyThreshold: Int,
+    userCacheKey: Option[String] = None
+) extends MergeStrategy {
   override val isBuiltIn = false
+  override val cacheKey: Option[String] = userCacheKey.map(key => s"$name (Custom, cacheKey=$key)")
 }
 
 object MergeStrategy {
@@ -236,12 +249,15 @@ object CustomMergeStrategy {
    * @param notifyIfGTE logs the summary if the number of dependencies merged is greater than or equal to this number.
    *                    If the merge strategy involves a transformation of a single file, it is recommended to set this
    *                    to `1` to see the results in the log. Defaults to `2`
+   * @param cacheKey lets an assembly that uses this strategy be cached. The plugin can't see what `f` does, so the
+   *                 cache only knows `f` changed if this value changes: change it whenever you change `f`. Without
+   *                 it, every assembly that uses this strategy is rebuilt. Defaults to `None`
    * @param f the actual logic for merging the dependencies
    * @return a [[MergeStrategy]]
    */
-  def apply(strategyName: String, notifyIfGTE: Int = 2)(
+  def apply(strategyName: String, notifyIfGTE: Int = 2, cacheKey: Option[String] = None)(
       f: Vector[Dependency] => Either[String, Vector[JarEntry]]
-  ): MergeStrategy = new CustomMergeStrategy(strategyName, notifyIfGTE) {
+  ): MergeStrategy = new CustomMergeStrategy(strategyName, notifyIfGTE, cacheKey) {
     def apply(dependencies: Vector[Dependency]): Either[String, Vector[JarEntry]] = f(dependencies)
   }
 

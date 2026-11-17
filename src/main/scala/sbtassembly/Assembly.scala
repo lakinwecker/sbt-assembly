@@ -428,16 +428,16 @@ object Assembly {
           .groupBy(_.target)
           .map { case (target, _) =>
             val mergeStrategy = secondPassMergeStrategy(target).getOrElse(MergeStrategy.deduplicate)
-            target -> (mergeStrategy.isBuiltIn -> mergeStrategy.name)
+            target -> mergeStrategy.cacheKey.fold(false -> mergeStrategy.name)(true -> _)
           }
       }
       if (
         ao.cacheOutput &&
         !mergeStrategiesByPathList.values
-          .exists { case (isBuiltIn, name) =>
-            // if there is at least one custom merge strategy, we cannot predict what it does so we cannot use caching
-            if (!isBuiltIn) log.warn(s"Caching disabled because of a custom merge strategy: '$name'")
-            !isBuiltIn
+          .exists { case (cacheable, name) =>
+            // a custom merge strategy without a cache key could do anything, so its output can't be cached
+            if (!cacheable) log.warn(s"Caching disabled because of a custom merge strategy without a cacheKey: '$name'")
+            !cacheable
           }
       ) {
         val (_, classes) = classByParentDir.unzip
