@@ -1,0 +1,21 @@
+> assembly
+$ exists target/**/foo.jar
+> check
+
+# a custom merge strategy with a cacheKey doesn't disable caching
+> recordAssemblyMtime
+> assembly
+> checkAssemblyNotRebuilt
+> check
+
+# changing the cacheKey invalidates the cache
+> set ThisBuild / mergeKey := "v2"
+> recordAssemblyMtime
+> assembly
+> checkAssemblyRebuilt
+> check
+
+# and the new key is cached in turn
+> recordAssemblyMtime
+> assembly
+> checkAssemblyNotRebuilt

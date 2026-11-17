@@ -502,6 +502,14 @@ lazy val app = (project in file("app"))
 **NOTE**:
 - Unfortunately, using a custom `MergeStrategy` other than `rename` will create a function in which the plugin cannot predict
    the outcome. This custom function must always be executed if it matches a `PathList` pattern, and thus, **will disable caching**.
+- A custom strategy can keep caching on by passing a `cacheKey`. The plugin records the key in place of the function, so
+   change the key whenever you change what the function does:
+
+```scala
+CustomMergeStrategy("my-custom-merge-strat", cacheKey = Some("v1")) { conflicts =>
+  Right(Vector.empty)
+}
+```
 
 #### Jar assembly performance
 
