@@ -17,9 +17,10 @@ import scala.util.control.NonFatal
  *
  * Shading one library depends only on the library's bytes and the shade rules that apply to it, so the cache key is a
  * SHA-256 of both. The value is a jar of that library's entries after shading: each entry is stored under its shaded
- * name under the prefix `entries/`, with its original name in the entry comment. The prefix keeps a library's own
- * `META-INF/MANIFEST.MF` out of the root, where `JarFile` would check the signatures of a signed library against
- * entries that shading has rewritten.
+ * numbered name `entries/<n>`, with its original and shaded names in the entry comment. Numbering keeps entries apart
+ * when a library repeats a name (iceberg-spark-runtime has two `LICENSE` entries), and keeps a library's own
+ * `META-INF/MANIFEST.MF` out of the root, where `JarFile` would check a signed library's signatures against entries
+ * that shading has rewritten.
  *
  * Turned on by pointing the system property `sbtassembly.shadedLibraryCache` at a directory. Every project that
  * points at the same directory shares it.
@@ -27,15 +28,20 @@ import scala.util.control.NonFatal
 private[sbtassembly] object ShadedLibraryCache {
   private val dirProperty = "sbtassembly.shadedLibraryCache"
   private val prefix = "entries/"
+  private val separator = '\u0000'
+  /** Part of the key, so a change to how cache files are laid out never reads a file written the old way */
+  private val formatVersion = "2"
 
   /** PROTOTYPE instrumentation: summed across the parallel per-jar work, so the times are CPU-ish, not wall clock */
   final class Stats {
     val hits, misses, bypassed = new java.util.concurrent.atomic.AtomicInteger
     val keyNanos, readNanos, writeNanos = new java.util.concurrent.atomic.AtomicLong
+    val missedJars = new java.util.concurrent.ConcurrentLinkedQueue[String]
     private def ms(n: java.util.concurrent.atomic.AtomicLong) = n.get / 1000000
     def summary: String =
       s"hits=${hits.get} misses=${misses.get} no-rules=${bypassed.get} " +
-        s"key=${ms(keyNanos)}ms read=${ms(readNanos)}ms write=${ms(writeNanos)}ms (summed over threads)"
+        s"key=${ms(keyNanos)}ms read=${ms(readNanos)}ms write=${ms(writeNanos)}ms (summed over threads)" +
+        (if (misses.get <= 10) missedJars.asScala.toSeq.sorted.mkString(" missed: ", ", ", "") else "")
   }
 
   /**
@@ -60,6 +66,7 @@ private[sbtassembly] object ShadedLibraryCache {
     }
     digest.update(ruleDescriptions.mkString("\n").getBytes(UTF_8))
     digest.update(failOnShadeError.toString.getBytes(UTF_8))
+    digest.update(formatVersion.getBytes(UTF_8))
     val key = digest.digest().map("%02x".format(_)).mkString
     new File(dir, s"$key.jar")
   }
@@ -68,7 +75,8 @@ private[sbtassembly] object ShadedLibraryCache {
     pool.withJar(cached) { jar =>
       jar.entries().asScala.toVector.map { entry =>
         val stored = entry.getName
-        Library(module, entry.getComment, stored.stripPrefix(prefix), new RawSource(cached, stored, pool))
+        val Array(source, target) = entry.getComment.split(separator)
+        Library(module, source, target, new RawSource(cached, stored, pool))
       }
     }
 
@@ -78,9 +86,9 @@ private[sbtassembly] object ShadedLibraryCache {
     val tmp = File.createTempFile(cached.getName, ".tmp", cached.getParentFile)
     try {
       Using.resource((f: File) => new ZipOutputStream(new BufferedOutputStream(new FileOutputStream(f))))(tmp) { out =>
-        libraries.foreach { library =>
-          val entry = new ZipEntry(prefix + library.target)
-          entry.setComment(library.source)
+        libraries.zipWithIndex.foreach { case (library, index) =>
+          val entry = new ZipEntry(prefix + index)
+          entry.setComment(library.source + separator + library.target)
           out.putNextEntry(entry)
           Using.resource((l: Library) => l.stream())(library)(in => sbt.io.IO.transfer(in, out))
           out.closeEntry()

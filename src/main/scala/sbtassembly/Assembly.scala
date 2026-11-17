@@ -344,6 +344,7 @@ object Assembly {
               libraries.par
             } else {
               cacheStats.misses.incrementAndGet()
+              cacheStats.missedJars.add(jarPath.getName)
               val libraries = shadeJar()
               val writeStart = System.nanoTime()
               ShadedLibraryCache.write(cached, libraries.seq)
