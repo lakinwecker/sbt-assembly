@@ -275,19 +275,46 @@ object Assembly {
         val dir = toNioPath(dir0)
         (dir.toFile ** (-DirectoryFilter)).get().map(dir -> _.toPath)
       }
+    val compilingRules = nonKeepRules.filter(_.isApplicableToCompiling)
+    val jarFilePool = JarFilePool()
+    val shadedLibraryCache = ShadedLibraryCache.dir
+    val cacheStats = new ShadedLibraryCache.Stats
+    def shadeProjectFiles(files: Vector[(NioPath, NioPath)]): Vector[Project] =
+      files.flatMap { case (parentDir, file) =>
+        val originalTarget = parentDir.relativize(file).toString
+        val sanitizedTarget =
+          if (originalTarget.contains('\\')) originalTarget.replace('\\', '/')
+          else originalTarget
+        classShader(sanitizedTarget, () => new BufferedInputStream(new FileInputStream(file.toFile)))
+          .map { case (shadedName, stream) =>
+            Project(targetJarName, sanitizedTarget, shadedName, stream)
+          }
+      }
     val classMappings =
       timed(Level.Debug, "Collect and shade project classes") {
-        classByParentDir
-          .flatMap { case (parentDir, file) =>
-            val originalTarget = parentDir.relativize(file).toString
-            val sanitizedTarget =
-              if (originalTarget.contains('\\')) originalTarget.replace('\\', '/')
-              else originalTarget
-            classShader(sanitizedTarget, () => new BufferedInputStream(new FileInputStream(file.toFile)))
-              .map { case (shadedName, stream) =>
-                Project(targetJarName, sanitizedTarget, shadedName, stream)
+        shadedLibraryCache.filter(_ => compilingRules.nonEmpty) match {
+          case None => shadeProjectFiles(classByParentDir)
+          case Some(dir) =>
+            val byDir = classByParentDir.groupBy(_._1)
+            classByParentDir.map(_._1).distinct.par.flatMap { parentDir =>
+              val files = byDir(parentDir)
+              val cached = ShadedLibraryCache.directoryFile(
+                dir,
+                files.map { case (p, f) => p.relativize(f).toString -> f.toFile },
+                compilingRules.map(_.toString),
+                ao.failOnShadeError
+              )
+              if (cached.exists) {
+                cacheStats.directoryHits.incrementAndGet()
+                ShadedLibraryCache.readProject(cached, targetJarName, jarFilePool)
+              } else {
+                cacheStats.directoryMisses.incrementAndGet()
+                val projects = shadeProjectFiles(files)
+                ShadedLibraryCache.write(cached, projects)
+                projects
               }
-          }
+            }.seq.toVector
+        }
       }
 
     val rulesFor = (module: ModuleCoordinate) =>
@@ -299,9 +326,6 @@ object Assembly {
             )
         )
     val jarShader = (module: ModuleCoordinate) => shader(rulesFor(module), log, ao.failOnShadeError)
-    val shadedLibraryCache = ShadedLibraryCache.dir
-    val cacheStats = new ShadedLibraryCache.Stats
-    val jarFilePool = JarFilePool()
     val jarFileEntries = timed(Level.Debug, "Collect and shade dependency entries") {
       val (externalJars, projectJars) = filteredJars.partition(externalDeps.contains)
       (projectJars ++ externalJars).par.map { jar =>

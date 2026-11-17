@@ -1,7 +1,7 @@
 package sbtassembly
 
 import sbt.io.Using
-import sbtassembly.Assembly.{ Library, ModuleCoordinate }
+import sbtassembly.Assembly.{ Dependency, Library, ModuleCoordinate, Project }
 
 import java.io.{ BufferedOutputStream, File, FileOutputStream }
 import java.nio.charset.StandardCharsets.UTF_8
@@ -30,16 +30,18 @@ private[sbtassembly] object ShadedLibraryCache {
   private val prefix = "entries/"
   private val separator = '\u0000'
   /** Part of the key, so a change to how cache files are laid out never reads a file written the old way */
-  private val formatVersion = "2"
+  private val formatVersion = "3"
 
   /** PROTOTYPE instrumentation: summed across the parallel per-jar work, so the times are CPU-ish, not wall clock */
   final class Stats {
     val hits, misses, bypassed = new java.util.concurrent.atomic.AtomicInteger
+    val directoryHits, directoryMisses = new java.util.concurrent.atomic.AtomicInteger
     val keyNanos, readNanos, writeNanos = new java.util.concurrent.atomic.AtomicLong
     val missedJars = new java.util.concurrent.ConcurrentLinkedQueue[String]
     private def ms(n: java.util.concurrent.atomic.AtomicLong) = n.get / 1000000
     def summary: String =
-      s"hits=${hits.get} misses=${misses.get} no-rules=${bypassed.get} " +
+      s"directories hits=${directoryHits.get} misses=${directoryMisses.get}, " +
+        s"libraries hits=${hits.get} misses=${misses.get} no-rules=${bypassed.get} " +
         s"key=${ms(keyNanos)}ms read=${ms(readNanos)}ms write=${ms(writeNanos)}ms (summed over threads)" +
         (if (misses.get <= 10) missedJars.asScala.toSeq.sorted.mkString(" missed: ", ", ", "") else "")
   }
@@ -54,15 +56,39 @@ private[sbtassembly] object ShadedLibraryCache {
 
   def dir: Option[File] = sys.props.get(dirProperty).filter(_.nonEmpty).map(new File(_))
 
-  def file(dir: File, jar: File, ruleDescriptions: Seq[String], failOnShadeError: Boolean): File = {
+  def file(dir: File, jar: File, ruleDescriptions: Seq[String], failOnShadeError: Boolean): File =
+    fileFor(dir, Seq("" -> jar), ruleDescriptions, failOnShadeError)
+
+  /**
+   * The cache file for one directory of compiled classes and resources: the key covers every file's path within the
+   * directory and its bytes, so it changes when anything in the directory does.
+   */
+  def directoryFile(
+      dir: File,
+      files: Seq[(String, File)],
+      ruleDescriptions: Seq[String],
+      failOnShadeError: Boolean
+  ): File = fileFor(dir, files.sortBy(_._1), ruleDescriptions, failOnShadeError)
+
+  private def fileFor(
+      dir: File,
+      files: Seq[(String, File)],
+      ruleDescriptions: Seq[String],
+      failOnShadeError: Boolean
+  ): File = {
     val digest = MessageDigest.getInstance("SHA-256")
-    Using.fileInputStream(jar) { in =>
-      val buffer = new Array[Byte](1 << 20)
-      var read = in.read(buffer)
-      while (read >= 0) {
-        digest.update(buffer, 0, read)
-        read = in.read(buffer)
+    val buffer = new Array[Byte](1 << 20)
+    files.foreach { case (name, file) =>
+      digest.update(name.getBytes(UTF_8))
+      digest.update(separator.toByte)
+      Using.fileInputStream(file) { in =>
+        var read = in.read(buffer)
+        while (read >= 0) {
+          digest.update(buffer, 0, read)
+          read = in.read(buffer)
+        }
       }
+      digest.update(separator.toByte)
     }
     digest.update(ruleDescriptions.mkString("\n").getBytes(UTF_8))
     digest.update(failOnShadeError.toString.getBytes(UTF_8))
@@ -72,16 +98,22 @@ private[sbtassembly] object ShadedLibraryCache {
   }
 
   def read(cached: File, module: ModuleCoordinate, pool: JarFilePool): Vector[Library] =
+    readEntries(cached, pool).map { case (source, target, raw) => Library(module, source, target, raw) }
+
+  def readProject(cached: File, name: String, pool: JarFilePool): Vector[Project] =
+    readEntries(cached, pool).map { case (source, target, raw) => Project(name, source, target, raw) }
+
+  private def readEntries(cached: File, pool: JarFilePool): Vector[(String, String, RawSource)] =
     pool.withJar(cached) { jar =>
       jar.entries().asScala.toVector.map { entry =>
         val stored = entry.getName
         val Array(source, target) = entry.getComment.split(separator)
-        Library(module, source, target, new RawSource(cached, stored, pool))
+        (source, target, new RawSource(cached, stored, pool))
       }
     }
 
   /** Writes `libraries` to `cached`; leaves nothing behind if it can't, since the cache is only an optimisation */
-  def write(cached: File, libraries: Seq[Library]): Unit = {
+  def write(cached: File, libraries: Seq[Dependency]): Unit = {
     cached.getParentFile.mkdirs()
     val tmp = File.createTempFile(cached.getName, ".tmp", cached.getParentFile)
     try {
@@ -90,7 +122,7 @@ private[sbtassembly] object ShadedLibraryCache {
           val entry = new ZipEntry(prefix + index)
           entry.setComment(library.source + separator + library.target)
           out.putNextEntry(entry)
-          Using.resource((l: Library) => l.stream())(library)(in => sbt.io.IO.transfer(in, out))
+          Using.resource((l: Dependency) => l.stream())(library)(in => sbt.io.IO.transfer(in, out))
           out.closeEntry()
         }
       }
