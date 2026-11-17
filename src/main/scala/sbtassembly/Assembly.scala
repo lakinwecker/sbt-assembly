@@ -300,6 +300,7 @@ object Assembly {
         )
     val jarShader = (module: ModuleCoordinate) => shader(rulesFor(module), log, ao.failOnShadeError)
     val shadedLibraryCache = ShadedLibraryCache.dir
+    val cacheStats = new ShadedLibraryCache.Stats
     val jarFilePool = JarFilePool()
     val jarFileEntries = timed(Level.Debug, "Collect and shade dependency entries") {
       val (externalJars, projectJars) = filteredJars.partition(externalDeps.contains)
@@ -328,18 +329,31 @@ object Assembly {
           }
         val rules = rulesFor(module)
         shadedLibraryCache.filter(_ => rules.nonEmpty) match {
-          case None => shadeJar()
+          case None =>
+            cacheStats.bypassed.incrementAndGet()
+            shadeJar()
           case Some(dir) =>
+            val keyStart = System.nanoTime()
             val cached = ShadedLibraryCache.file(dir, jarPath, rules.map(_.toString), ao.failOnShadeError)
-            if (cached.exists) ShadedLibraryCache.read(cached, module, jarFilePool).par
-            else {
+            cacheStats.keyNanos.addAndGet(System.nanoTime() - keyStart)
+            if (cached.exists) {
+              cacheStats.hits.incrementAndGet()
+              val readStart = System.nanoTime()
+              val libraries = ShadedLibraryCache.read(cached, module, jarFilePool)
+              cacheStats.readNanos.addAndGet(System.nanoTime() - readStart)
+              libraries.par
+            } else {
+              cacheStats.misses.incrementAndGet()
               val libraries = shadeJar()
+              val writeStart = System.nanoTime()
               ShadedLibraryCache.write(cached, libraries.seq)
+              cacheStats.writeNanos.addAndGet(System.nanoTime() - writeStart)
               libraries
             }
         }
       }
     }
+    log.info(s"Shaded library cache: dir=${shadedLibraryCache.getOrElse("off")}, ${cacheStats.summary}")
 
     try {
       val (mappingsToRename, others) = timed(Level.Debug, "Collect renames") {
@@ -396,7 +410,8 @@ object Assembly {
             if (!dest.exists()) {
               dest.mkdirs()
             }
-            createJar(absOutput, jarEntriesToWrite, jarManifest, localTime)
+            if (shadedLibraryCache.isDefined) createJarCopyingCachedEntries(absOutput, jarEntriesToWrite, jarManifest, localTime)
+            else createJar(absOutput, jarEntriesToWrite, jarManifest, localTime)
           }
         }
         val fullSha1 = timed(Level.Debug, "Hash newly-built Jar") {
@@ -597,6 +612,74 @@ object Assembly {
         val name = if (mapping.contains('/')) mapping.replace('/', '\\') else mapping
         JarEntry(name, () => new ByteArrayInputStream(entryStruct.data))
       })
+  }
+
+  /**
+   * PROTOTYPE. Writes the jar like [[createJar]], but copies an entry that still has a cached library's stream
+   * ([[ShadedLibraryCache.RawSource]]) as its compressed bytes, reusing the cache file's CRC and sizes. Every other
+   * entry is deflated as usual. Parent directories get their own entries, as the zip file system writes them.
+   */
+  private[sbtassembly] def createJarCopyingCachedEntries(
+      output: File,
+      entries: Seq[JarEntry],
+      manifest: JManifest,
+      localTime: Long
+  ): Unit = {
+    import org.apache.commons.compress.archivers.zip.{ ZipArchiveEntry, ZipArchiveOutputStream, ZipFile => CZipFile }
+    val sources = scala.collection.mutable.HashMap.empty[File, CZipFile]
+    val directories = scala.collection.mutable.HashSet.empty[String]
+    val out = new ZipArchiveOutputStream(output)
+    def addParentDirectories(target: String): Unit = {
+      var slash = target.indexOf('/')
+      while (slash >= 0) {
+        val directory = target.substring(0, slash + 1)
+        if (directories.add(directory)) {
+          val entry = new ZipArchiveEntry(directory)
+          entry.setMethod(java.util.zip.ZipEntry.STORED)
+          entry.setSize(0)
+          entry.setCompressedSize(0)
+          entry.setCrc(0)
+          entry.setTime(localTime)
+          out.putArchiveEntry(entry)
+          out.closeArchiveEntry()
+        }
+        slash = target.indexOf('/', slash + 1)
+      }
+    }
+    def deflate(target: String)(write: java.io.OutputStream => Unit): Unit = {
+      addParentDirectories(target)
+      val entry = new ZipArchiveEntry(target)
+      entry.setMethod(java.util.zip.ZipEntry.DEFLATED)
+      entry.setTime(localTime)
+      out.putArchiveEntry(entry)
+      write(out)
+      out.closeArchiveEntry()
+    }
+    try {
+      deflate("META-INF/MANIFEST.MF")(manifest.write)
+      entries.foreach { jarEntry =>
+        jarEntry.stream match {
+          case raw: ShadedLibraryCache.RawSource =>
+            addParentDirectories(jarEntry.target)
+            val source = sources.getOrElseUpdate(raw.file, new CZipFile(raw.file))
+            val cached = source.getEntry(raw.name)
+            val entry = new ZipArchiveEntry(jarEntry.target)
+            entry.setMethod(cached.getMethod)
+            entry.setCrc(cached.getCrc)
+            entry.setSize(cached.getSize)
+            entry.setCompressedSize(cached.getCompressedSize)
+            entry.setTime(localTime)
+            val rawStream = source.getRawInputStream(cached)
+            try out.addRawArchiveEntry(entry, rawStream)
+            finally rawStream.close()
+          case _ =>
+            deflate(jarEntry.target)(o => jarEntryInputStreamResource(jarEntry)(in => IO.transfer(in, o)))
+        }
+      }
+    } finally {
+      out.close()
+      sources.values.foreach(_.close())
+    }
   }
 
   private[sbtassembly] def createJar(

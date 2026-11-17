@@ -28,6 +28,24 @@ private[sbtassembly] object ShadedLibraryCache {
   private val dirProperty = "sbtassembly.shadedLibraryCache"
   private val prefix = "entries/"
 
+  /** PROTOTYPE instrumentation: summed across the parallel per-jar work, so the times are CPU-ish, not wall clock */
+  final class Stats {
+    val hits, misses, bypassed = new java.util.concurrent.atomic.AtomicInteger
+    val keyNanos, readNanos, writeNanos = new java.util.concurrent.atomic.AtomicLong
+    private def ms(n: java.util.concurrent.atomic.AtomicLong) = n.get / 1000000
+    def summary: String =
+      s"hits=${hits.get} misses=${misses.get} no-rules=${bypassed.get} " +
+        s"key=${ms(keyNanos)}ms read=${ms(readNanos)}ms write=${ms(writeNanos)}ms (summed over threads)"
+  }
+
+  /**
+   * The stream of a cached entry. A merge that keeps an entry unchanged passes its stream through as is, so the jar
+   * writer can recognise this type and copy the entry's compressed bytes from the cache file without recompressing.
+   */
+  final class RawSource(val file: File, val name: String, pool: JarFilePool) extends (() => java.io.InputStream) {
+    def apply(): java.io.InputStream = pool.stream(file, name)
+  }
+
   def dir: Option[File] = sys.props.get(dirProperty).filter(_.nonEmpty).map(new File(_))
 
   def file(dir: File, jar: File, ruleDescriptions: Seq[String], failOnShadeError: Boolean): File = {
@@ -50,7 +68,7 @@ private[sbtassembly] object ShadedLibraryCache {
     pool.withJar(cached) { jar =>
       jar.entries().asScala.toVector.map { entry =>
         val stored = entry.getName
-        Library(module, entry.getComment, stored.stripPrefix(prefix), () => pool.stream(cached, stored))
+        Library(module, entry.getComment, stored.stripPrefix(prefix), new RawSource(cached, stored, pool))
       }
     }
 
