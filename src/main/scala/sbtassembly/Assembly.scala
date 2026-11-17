@@ -680,11 +680,15 @@ object Assembly {
       write(out)
       out.closeArchiveEntry()
     }
+    var rawCount, deflatedCount = 0
+    var rawNanos, deflatedNanos = 0L
     try {
       deflate("META-INF/MANIFEST.MF")(manifest.write)
       entries.foreach { jarEntry =>
+        val start = System.nanoTime()
         jarEntry.stream match {
           case raw: ShadedLibraryCache.RawSource =>
+            rawCount += 1
             addParentDirectories(jarEntry.target)
             val source = sources.getOrElseUpdate(raw.file, new CZipFile(raw.file))
             val cached = source.getEntry(raw.name)
@@ -697,13 +701,22 @@ object Assembly {
             val rawStream = source.getRawInputStream(cached)
             try out.addRawArchiveEntry(entry, rawStream)
             finally rawStream.close()
+            rawNanos += System.nanoTime() - start
           case _ =>
+            deflatedCount += 1
             deflate(jarEntry.target)(o => jarEntryInputStreamResource(jarEntry)(in => IO.transfer(in, o)))
+            deflatedNanos += System.nanoTime() - start
         }
       }
     } finally {
+      val closeStart = System.nanoTime()
       out.close()
       sources.values.foreach(_.close())
+      println(
+        s"[info] createJarCopyingCachedEntries: raw=$rawCount in ${rawNanos / 1000000}ms, " +
+          s"deflated=$deflatedCount in ${deflatedNanos / 1000000}ms, total written ${out.getBytesWritten / 1000000}MB, " +
+          s"directories=${directories.size}, close=${(System.nanoTime() - closeStart) / 1000000}ms"
+      )
     }
   }
 
