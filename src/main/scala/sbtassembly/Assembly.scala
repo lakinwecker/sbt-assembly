@@ -12,12 +12,13 @@ import sbt.Tags.Tag
 import CacheImplicits.*
 import sbtassembly.AssemblyPlugin.autoImport.{ Assembly as _, MergeStrategy as _, *}
 
-import java.io.{ BufferedInputStream, ByteArrayInputStream, FileInputStream, InputStream }
+import java.io.{ BufferedInputStream, ByteArrayInputStream, FileInputStream, IOException, InputStream }
 import java.net.URI
 import java.nio.file.attribute.{ BasicFileAttributeView, FileTime, PosixFilePermission }
 import java.nio.file.{ Path as NioPath, *}
 import java.security.MessageDigest
 import java.time.Instant
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.jar.{ Attributes as JAttributes, Manifest as JManifest }
 import scala.annotation.tailrec
 import scala.language.postfixOps
@@ -290,19 +291,52 @@ object Assembly {
           }
       }
 
-    val jarShader = (module: ModuleCoordinate) =>
-      shader(
-        nonKeepRules
-          .filter(rule =>
-            rule.isApplicableToAll ||
-              rule.isApplicableTo(
-                com.eed3si9n.jarjarabrams.ModuleCoordinate(module.organization, module.name, module.version)
-              )
-          ),
-        log,
-        ao.failOnShadeError
-      )
+    val rulesFor = (module: ModuleCoordinate) =>
+      nonKeepRules
+        .filter(rule =>
+          rule.isApplicableToAll ||
+            rule.isApplicableTo(
+              com.eed3si9n.jarjarabrams.ModuleCoordinate(module.organization, module.name, module.version)
+            )
+        )
+    val jarShader = (module: ModuleCoordinate) => shader(rulesFor(module), log, ao.failOnShadeError)
     val jarFilePool = JarFilePool()
+    val shadeCacheHits, shadeCacheMisses = new AtomicInteger
+
+    /**
+     * The library's shaded entries from the shade cache, shading the library into the cache first if it isn't there.
+     * None if the cache file can't be written, so the caller shades the library without the cache.
+     */
+    def cachedLibrary(dir: File, jar: File, module: ModuleCoordinate, rules: SeqShadeRules): Option[Vector[Library]] = {
+      val cached = ShadeCache.libraryFile(dir, jar, rules, ao.failOnShadeError)
+      val entries = ShadeCache.read(cached, jarFilePool, log) match {
+        case hit @ Some(_) =>
+          shadeCacheHits.incrementAndGet()
+          hit
+        case None =>
+          shadeCacheMisses.incrementAndGet()
+          try {
+            // One shader for the whole jar, which is safe because write reads the entries one at a time
+            val shade = shader(rules, log, ao.failOnShadeError)
+            jarFilePool.withJar(jar) { jarFile =>
+              val shaded = jarFile.entries().asScala.filterNot(_.isDirectory).flatMap { entry =>
+                val entryName = entry.getName
+                shade(entryName, () => jarFilePool.stream(jar, entryName)).map { case (shadedName, stream) =>
+                  ShadeCache.Entry(entryName, shadedName, stream)
+                }
+              }
+              ShadeCache.write(cached, shaded)
+            }
+            ShadeCache.read(cached, jarFilePool, log)
+          } catch {
+            case e: IOException =>
+              log.warn(s"Shading ${jar.getName} without the shade cache, since $cached could not be written: $e")
+              None
+          }
+      }
+      entries.map(_.map(entry => Library(module, entry.source, entry.target, entry.stream)))
+    }
+
     val jarFileEntries = timed(Level.Debug, "Collect and shade dependency entries") {
       val (externalJars, projectJars) = filteredJars.partition(externalDeps.contains)
       (projectJars ++ externalJars).par.map { jar =>
@@ -312,22 +346,36 @@ object Assembly {
           .map(m => ModuleCoordinate(m.organization, m.name, m.revision))
           .getOrElse(ModuleCoordinate("", jar.data.name.replaceAll(".jar", ""), ""))
         val jarPath = toFile(jar)
-        jarFilePool.withJar(jarPath) { jarFile =>
-          jarFile
-            .entries()
-            .asScala
-            .filterNot(_.isDirectory)
-            .toVector
-            .par
-            .flatMap { entry =>
-              val entryName = entry.getName
-              jarShader(module)(entryName, () => jarFilePool.stream(jarPath, entryName))
-                .map { case (shadedName, stream) =>
-                  Library(module, entryName, shadedName, stream)
+        val rules = rulesFor(module)
+        // A library no rule applies to is copied as it is, so caching it would only add work
+        val fromCache = ao.shadeCacheDirectory
+          .filter(_ => rules.nonEmpty)
+          .flatMap(dir => cachedLibrary(dir, jarPath, module, rules))
+        fromCache match {
+          case Some(libraries) => libraries.par
+          case None =>
+            jarFilePool.withJar(jarPath) { jarFile =>
+              jarFile
+                .entries()
+                .asScala
+                .filterNot(_.isDirectory)
+                .toVector
+                .par
+                .flatMap { entry =>
+                  val entryName = entry.getName
+                  jarShader(module)(entryName, () => jarFilePool.stream(jarPath, entryName))
+                    .map { case (shadedName, stream) =>
+                      Library(module, entryName, shadedName, stream)
+                    }
                 }
             }
         }
       }
+    }
+    ao.shadeCacheDirectory.foreach { dir =>
+      log.debug(
+        s"Shade cache $dir: found ${shadeCacheHits.get} libraries, shaded and stored ${shadeCacheMisses.get}"
+      )
     }
 
     try {

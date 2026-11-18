@@ -32,6 +32,7 @@ trait AssemblyKeys {
   lazy val assemblyCacheOutput       = settingKey[Boolean]("Enables (true) or disables (false) cacheing the output if the content has not changed")
   lazy val assemblyPrependShellScript = settingKey[Option[Seq[String]]]("A launch script to prepend to the über JAR")
   lazy val assemblyFailOnShadeError  = settingKey[Boolean]("Fails the build when an entry cannot be shaded, instead of keeping it unshaded or dropping it")
+  lazy val assemblyShadeCacheDirectory = settingKey[Option[File]]("Directory that keeps each library's shaded entries, so every assembly that uses it shades a library only once. None (the default) turns it off")
   lazy val assemblyRepeatableBuild   = settingKey[Boolean]("If (true), builds the jar with a consistent hash (given the same inputs/assembly configuration) so it can be cached, but loses parallelism optimization. " +
                                                                        "If (false), builds the jar faster via parallelization, but loses hash consistency, and hence, cannot be cached")
 }

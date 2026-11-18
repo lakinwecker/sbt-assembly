@@ -1,0 +1,16 @@
+> assembly
+> checkShaded
+> recordCache
+
+# a different rule names different cache files, so every library is shaded again
+> set prefix := "two"
+> assembly
+> checkShaded
+> checkCacheGrew
+
+# the first rule's files are still there, so going back to it shades nothing
+> recordCache
+> set prefix := "one"
+> assembly
+> checkShaded
+> checkCacheUnchanged

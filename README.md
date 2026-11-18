@@ -80,7 +80,7 @@ And here is the list of the keys you can rewite that are scoped globally:
 
     assemblyAppendContentHash     assemblyCacheOutput           assemblyShadeRules
     assemblyExcludedJars          assemblyMergeStrategy         assemblyRepeatableBuild
-    assemblyFailOnShadeError
+    assemblyFailOnShadeError      assemblyShadeCacheDirectory
 
 Keys scoped to the subproject should be placed in `.settings(...)` whereas the globally scoped keys can either be placed inside of `.settings(...)` or scoped using `ThisBuild / ` to be shared across multiple subprojects.
 
@@ -510,6 +510,26 @@ CustomMergeStrategy("my-custom-merge-strat", cacheKey = Some("v1")) { conflicts 
   Right(Vector.empty)
 }
 ```
+
+#### Shade cache
+
+Every time it builds the über JAR, sbt-assembly shades every library that a shade rule applies to, and a rule
+`.inAll` applies to all of them. The output cache above doesn't help when anything at all has changed, and builds
+that make several über JARs from mostly the same libraries shade each library once per JAR.
+
+`assemblyShadeCacheDirectory` keeps each library's shaded entries in a directory, so a library is shaded once and
+then read back by every assembly that points at the same directory:
+
+```scala
+ThisBuild / assemblyShadeCacheDirectory := Some((ThisBuild / baseDirectory).value / "target" / "shade-cache")
+```
+
+A cache file is named by a hash of the library JAR's bytes, the shade rules that apply to it,
+`assemblyFailOnShadeError`, and the versions of the shading libraries. Changing any of them writes a new file
+rather than updating the old one. Nothing removes old files, so delete the directory now and then to reclaim the
+space. Several assemblies can use one directory at the same time, and it can be kept between CI runs.
+
+The cache is off by default.
 
 #### Jar assembly performance
 

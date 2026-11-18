@@ -32,4 +32,7 @@ type AssemblyOption {
 
   ## fail the build when an entry cannot be shaded, instead of keeping it unshaded
   failOnShadeError: Boolean! = true @since("2.4.1")
+
+  ## directory that keeps each library's shaded entries for reuse; None turns the cache off
+  shadeCacheDirectory: java.io.File @since("2.4.1")
 }

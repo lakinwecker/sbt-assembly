@@ -40,6 +40,7 @@ object AssemblyPlugin extends sbt.AutoPlugin {
     assemblyCacheOutput := true,
     assemblyRepeatableBuild := true,
     assemblyFailOnShadeError := true,
+    assemblyShadeCacheDirectory := None,
     concurrentRestrictions += Tags.limit(Assembly.assemblyTag, 1)
   )
 
@@ -125,6 +126,7 @@ object AssemblyPlugin extends sbt.AutoPlugin {
         .withLevel(logLevel.?.value.getOrElse(Level.Info))
         .withRepeatableBuild(assemblyRepeatableBuild.value)
         .withFailOnShadeError(assemblyFailOnShadeError.value)
+        .withShadeCacheDirectory(assemblyShadeCacheDirectory.value)
     }
   )
 
