@@ -535,17 +535,19 @@ object Assembly {
         misplacedClassStrategy = if (failOnShadeError) Some("fatal") else None,
       )
       (name: String, inputStream: LazyInputStream) => {
+        // Streamable.bytes reads a stream of unknown length one byte at a time into a boxed buffer, allocating
+        // about 22 times the entry's size. It also leaves the stream open, and an open JarFile stream keeps its
+        // inflater and read buffer for as long as the shaded entry is held, which is until the jar is written.
+        // Closing it here also lets JarFilePool close the library jar.
         val is = inputStream()
-        val bytes = Streamable.bytes(is)
+        val bytes =
+          try IO.readBytes(is)
+          finally is.close()
         val shadeResult = bytecodeShader(bytes, name)
         if (shadeResult.isEmpty) log.debug(s"Shade discarded: $name")
         shadeResult.map { case (bytes, shadedName) =>
           if (name != shadedName) log.debug(s"Shaded: $name -> $shadedName")
-          shadedName -> (() =>
-            new ByteArrayInputStream(bytes) {
-              override def close(): Unit = is.close()
-            }
-          )
+          shadedName -> (() => new ByteArrayInputStream(bytes))
         }
       }
     }
