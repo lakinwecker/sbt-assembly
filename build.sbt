@@ -35,6 +35,8 @@ lazy val root = (project in file("."))
       "-Dscalac.patmat.analysisBudget=1024",
     )
     libraryDependencies += jarjar
+    // writes entries from the shade cache into the jar without inflating and compressing them again
+    libraryDependencies += "org.apache.commons" % "commons-compress" % "1.27.1"
     addSbtPlugin("com.github.sbt" % "sbt2-compat" % "0.1.0")
     (pluginCrossBuild / sbtVersion) := {
       scalaBinaryVersion.value match {

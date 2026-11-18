@@ -433,7 +433,9 @@ object Assembly {
             if (!dest.exists()) {
               dest.mkdirs()
             }
-            createJar(absOutput, jarEntriesToWrite, jarManifest, localTime)
+            if (ao.shadeCacheDirectory.isDefined)
+              createJarCopyingCachedEntries(absOutput, jarEntriesToWrite, jarManifest, localTime)
+            else createJar(absOutput, jarEntriesToWrite, jarManifest, localTime)
           }
         }
         val fullSha1 = timed(Level.Debug, "Hash newly-built Jar") {
@@ -636,6 +638,93 @@ object Assembly {
         val name = if (mapping.contains('/')) mapping.replace('/', '\\') else mapping
         JarEntry(name, () => new ByteArrayInputStream(entryStruct.data))
       })
+  }
+
+  /**
+   * Writes the jar like [[createJar]], except that an entry whose stream still comes straight from a shade cache file
+   * ([[ShadeCache.RawSource]]) is copied as the compressed bytes stored there, with the CRC and sizes stored with
+   * them, instead of being inflated and compressed again. Every other entry is compressed as usual. Like the zip file
+   * system that createJar writes with, it adds an entry for each parent directory.
+   */
+  private[sbtassembly] def createJarCopyingCachedEntries(
+      output: File,
+      entries: Seq[JarEntry],
+      manifest: JManifest,
+      localTime: Long
+  ): Unit = {
+    import org.apache.commons.compress.archivers.zip.{ ZipArchiveEntry, ZipArchiveOutputStream, ZipFile as CZipFile }
+    val manifestName = "META-INF/MANIFEST.MF"
+    // Cache files open for copying, closed least recently used first to stay within JarFilePool's bound
+    val maxOpen = JarFilePool.defaultMaxOpen
+    val sources = new java.util.LinkedHashMap[File, CZipFile](16, 0.75f, true) {
+      override def removeEldestEntry(eldest: java.util.Map.Entry[File, CZipFile]): Boolean =
+        if (size > maxOpen) {
+          eldest.getValue.close()
+          true
+        } else false
+    }
+    val directories = scala.collection.mutable.HashSet.empty[String]
+    val out = new ZipArchiveOutputStream(output)
+    def addParentDirectories(target: String): Unit = {
+      var slash = target.indexOf('/')
+      while (slash >= 0) {
+        val directory = target.substring(0, slash + 1)
+        if (directories.add(directory)) {
+          val entry = new ZipArchiveEntry(directory)
+          entry.setMethod(java.util.zip.ZipEntry.STORED)
+          entry.setSize(0)
+          entry.setCompressedSize(0)
+          entry.setCrc(0)
+          entry.setTime(localTime)
+          out.putArchiveEntry(entry)
+          out.closeArchiveEntry()
+        }
+        slash = target.indexOf('/', slash + 1)
+      }
+    }
+    def deflate(target: String)(write: java.io.OutputStream => Unit): Unit = {
+      addParentDirectories(target)
+      val entry = new ZipArchiveEntry(target)
+      entry.setMethod(java.util.zip.ZipEntry.DEFLATED)
+      entry.setTime(localTime)
+      out.putArchiveEntry(entry)
+      write(out)
+      out.closeArchiveEntry()
+    }
+    def add(jarEntry: JarEntry): Unit =
+      jarEntry.stream match {
+        case raw: ShadeCache.RawSource =>
+          addParentDirectories(jarEntry.target)
+          val source = Option(sources.get(raw.file)).getOrElse {
+            val opened = CZipFile.builder().setFile(raw.file).get()
+            sources.put(raw.file, opened)
+            opened
+          }
+          val cached = Option(source.getEntry(raw.name)).getOrElse(sys.error(s"${raw.name} is missing from ${raw.file}"))
+          val entry = new ZipArchiveEntry(jarEntry.target)
+          entry.setMethod(cached.getMethod)
+          entry.setCrc(cached.getCrc)
+          entry.setSize(cached.getSize)
+          entry.setCompressedSize(cached.getCompressedSize)
+          entry.setTime(localTime)
+          val compressed = source.getRawInputStream(cached)
+          try out.addRawArchiveEntry(entry, compressed)
+          finally compressed.close()
+        case _ =>
+          deflate(jarEntry.target)(o => jarEntryInputStreamResource(jarEntry)(in => IO.transfer(in, o)))
+      }
+    try {
+      // A merged entry for the manifest replaces the one built from the package options, as it does in createJar.
+      // Either way it goes first, where JarInputStream looks for it.
+      val (manifestEntries, others) = entries.partition(_.target == manifestName)
+      manifestEntries.lastOption match {
+        case Some(entry) => add(entry)
+        case None        => deflate(manifestName)(manifest.write)
+      }
+      others.foreach(add)
+    } finally
+      try out.close()
+      finally sources.values.asScala.foreach(_.close())
   }
 
   private[sbtassembly] def createJar(

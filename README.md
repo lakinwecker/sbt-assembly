@@ -529,6 +529,9 @@ A cache file is named by a hash of the library JAR's bytes, the shade rules that
 rather than updating the old one. Nothing removes old files, so delete the directory now and then to reclaim the
 space. Several assemblies can use one directory at the same time, and it can be kept between CI runs.
 
+With the cache on, the über JAR is written differently: an entry that comes from the cache unchanged is copied in
+still compressed, rather than inflated and compressed again. The JAR has the same entries with the same contents.
+
 The cache is off by default.
 
 #### Jar assembly performance

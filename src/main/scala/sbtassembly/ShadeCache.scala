@@ -5,7 +5,7 @@ import sbt.Logger
 import sbt.io.{ IO, Using }
 import sbtassembly.Assembly.LazyInputStream
 
-import java.io.{ BufferedOutputStream, File, FileOutputStream, IOException }
+import java.io.{ BufferedOutputStream, File, FileOutputStream, IOException, InputStream }
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{ Files, StandardCopyOption }
 import java.security.MessageDigest
@@ -25,6 +25,9 @@ import scala.util.control.NonFatal
  * entry's original and shaded names in its comment. Numbered names keep apart entries that share a name within one
  * library, and keep a signed library's `META-INF/MANIFEST.MF` out of the root, where `JarFile` would check its
  * digests against classes that shading has rewritten.
+ *
+ * Entries read from a cache file carry a [[ShadeCache.RawSource]] as their stream, which lets the jar writer copy
+ * them into the über JAR still compressed.
  */
 private[sbtassembly] object ShadeCache {
 
@@ -36,6 +39,14 @@ private[sbtassembly] object ShadeCache {
    * @param stream the entry's bytes after shading
    */
   final case class Entry(source: String, target: String, stream: LazyInputStream)
+
+  /**
+   * The stream of an entry stored in a cache file. A merge that keeps an entry unchanged passes its stream along as
+   * it is, so the jar writer can recognise this type and copy the entry's compressed bytes out of `file`.
+   */
+  final class RawSource(val file: File, val name: String, pool: JarFilePool) extends (() => InputStream) {
+    def apply(): InputStream = pool.stream(file, name)
+  }
 
   private val entryPrefix = "entries/"
   private val separator = '\u0000'
@@ -94,7 +105,7 @@ private[sbtassembly] object ShadeCache {
           Some(zip.entries().asScala.toVector.map { stored =>
             val name = stored.getName
             Option(stored.getComment).map(_.split(separator)) match {
-              case Some(Array(source, target)) => Entry(source, target, () => pool.stream(cached, name))
+              case Some(Array(source, target)) => Entry(source, target, new RawSource(cached, name, pool))
               case _                           => throw new IOException(s"$name has no source and target names")
             }
           })
