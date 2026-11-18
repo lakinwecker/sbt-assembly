@@ -1,6 +1,7 @@
 // lib/dupnames.jar is the library from caching/shadecache; its source is in that test's lib-src/.
 
 lazy val prefix = settingKey[String]("Package the shade rule moves dupnames.** into")
+lazy val expectedOutput = settingKey[String]("What the assembled app prints")
 
 @transient
 lazy val checkShaded = taskKey[Unit]("Checks that the assembly is shaded with the current rule and runs")
@@ -31,6 +32,7 @@ lazy val root = (project in file("."))
     exportJars := false,
     assembly / assemblyJarName := "foo.jar",
     prefix := "one",
+    expectedOutput := "dup",
     assembly / assemblyShadeRules := Seq(ShadeRule.rename("dupnames.**" -> s"${prefix.value}.@1").inAll),
     assemblyShadeCacheDirectory := Some(baseDirectory.value / "shade-cache"),
     assemblyCacheOutput := false,
@@ -42,7 +44,7 @@ lazy val root = (project in file("."))
       val stale = names.filter(name => name.endsWith("/Dup.class") && name != expected)
       assert(stale.isEmpty, s"shaded by an old rule: ${stale.mkString(", ")}")
       val out = sys.process.Process("java", Seq("-jar", jar.toString)).!!.trim
-      assert(out == "dup", s"unexpected output: $out")
+      assert(out == expectedOutput.value, s"unexpected output: $out")
     },
     recordCache := IO.writeLines(target.value / "cache-listing.txt", listing(baseDirectory.value / "shade-cache")),
     checkCacheUnchanged := {

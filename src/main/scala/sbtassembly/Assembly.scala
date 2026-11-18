@@ -269,26 +269,94 @@ object Assembly {
         case _                    => false
       }
     }
-    val classShader = shader(nonKeepRules.filter(_.isApplicableToCompiling), log, ao.failOnShadeError)
+    val compilingRules = nonKeepRules.filter(_.isApplicableToCompiling)
+    val classShader = shader(compilingRules, log, ao.failOnShadeError)
     val classByParentDir: Vector[(NioPath, NioPath)] =
       if (!ao.includeBin) Vector.empty
       else dirs.flatMap { dir0 =>
         val dir = toNioPath(dir0)
         (dir.toFile ** (-DirectoryFilter)).get().map(dir -> _.toPath)
       }
+    val jarFilePool = JarFilePool()
+    val shadeCacheHits, shadeCacheMisses = new AtomicInteger
+
+    /**
+     * The entries stored in the shade cache file `cached`, after calling `write` to shade them into it if it isn't
+     * there. None if the file can't be written, so the caller shades `name` without the cache.
+     */
+    def throughShadeCache(cached: File, name: String)(write: => Unit): Option[Vector[ShadeCache.Entry]] =
+      ShadeCache.read(cached, jarFilePool, log) match {
+        case hit @ Some(_) =>
+          shadeCacheHits.incrementAndGet()
+          hit
+        case None =>
+          shadeCacheMisses.incrementAndGet()
+          try {
+            write
+            ShadeCache.read(cached, jarFilePool, log)
+          } catch {
+            case e: IOException =>
+              log.warn(s"Shading $name without the shade cache, since $cached could not be written: $e")
+              None
+          }
+      }
+
+    def projectTarget(parentDir: NioPath, file: NioPath): String = {
+      val originalTarget = parentDir.relativize(file).toString
+      if (originalTarget.contains('\\')) originalTarget.replace('\\', '/')
+      else originalTarget
+    }
+    def shadeProjectFiles(
+        files: Vector[(NioPath, NioPath)],
+        shade: (String, LazyInputStream) => Option[(String, LazyInputStream)]
+    ): Vector[Project] =
+      files.flatMap { case (parentDir, file) =>
+        val sanitizedTarget = projectTarget(parentDir, file)
+        shade(sanitizedTarget, () => new BufferedInputStream(new FileInputStream(file.toFile)))
+          .map { case (shadedName, stream) =>
+            Project(targetJarName, sanitizedTarget, shadedName, stream)
+          }
+      }
+
+    /**
+     * The shaded entries of one directory of compiled classes and resources, from the shade cache, shading the
+     * directory into the cache first if it isn't there. None if the cache file can't be written.
+     */
+    def cachedDirectory(dir: File, parentDir: NioPath, files: Vector[(NioPath, NioPath)]): Option[Vector[Project]] = {
+      val targets = files.map { case (parent, file) => projectTarget(parent, file) -> file.toFile }
+      val cached = ShadeCache.directoryFile(dir, targets, compilingRules, ao.failOnShadeError)
+      throughShadeCache(cached, parentDir.toString) {
+        // A shader of its own, since directories are shaded in parallel and a shader isn't thread-safe
+        val shade = shader(compilingRules, log, ao.failOnShadeError)
+        ShadeCache.write(
+          cached,
+          targets.iterator.flatMap { case (target, file) =>
+            shade(target, () => new BufferedInputStream(new FileInputStream(file))).map { case (shadedName, stream) =>
+              ShadeCache.Entry(target, shadedName, stream)
+            }
+          }
+        )
+      }.map(_.map(entry => Project(targetJarName, entry.source, entry.target, entry.stream)))
+    }
+
     val classMappings =
       timed(Level.Debug, "Collect and shade project classes") {
-        classByParentDir
-          .flatMap { case (parentDir, file) =>
-            val originalTarget = parentDir.relativize(file).toString
-            val sanitizedTarget =
-              if (originalTarget.contains('\\')) originalTarget.replace('\\', '/')
-              else originalTarget
-            classShader(sanitizedTarget, () => new BufferedInputStream(new FileInputStream(file.toFile)))
-              .map { case (shadedName, stream) =>
-                Project(targetJarName, sanitizedTarget, shadedName, stream)
+        ao.shadeCacheDirectory.filter(_ => compilingRules.nonEmpty) match {
+          case None => shadeProjectFiles(classByParentDir, classShader)
+          case Some(dir) =>
+            val filesByDir = classByParentDir.groupBy(_._1)
+            classByParentDir
+              .map(_._1)
+              .distinct
+              .par
+              .flatMap { parentDir =>
+                val files = filesByDir(parentDir)
+                cachedDirectory(dir, parentDir, files)
+                  .getOrElse(shadeProjectFiles(files, shader(compilingRules, log, ao.failOnShadeError)))
               }
-          }
+              .seq
+              .toVector
+        }
       }
 
     val rulesFor = (module: ModuleCoordinate) =>
@@ -300,8 +368,6 @@ object Assembly {
             )
         )
     val jarShader = (module: ModuleCoordinate) => shader(rulesFor(module), log, ao.failOnShadeError)
-    val jarFilePool = JarFilePool()
-    val shadeCacheHits, shadeCacheMisses = new AtomicInteger
 
     /**
      * The library's shaded entries from the shade cache, shading the library into the cache first if it isn't there.
@@ -309,32 +375,19 @@ object Assembly {
      */
     def cachedLibrary(dir: File, jar: File, module: ModuleCoordinate, rules: SeqShadeRules): Option[Vector[Library]] = {
       val cached = ShadeCache.libraryFile(dir, jar, rules, ao.failOnShadeError)
-      val entries = ShadeCache.read(cached, jarFilePool, log) match {
-        case hit @ Some(_) =>
-          shadeCacheHits.incrementAndGet()
-          hit
-        case None =>
-          shadeCacheMisses.incrementAndGet()
-          try {
-            // One shader for the whole jar, which is safe because write reads the entries one at a time
-            val shade = shader(rules, log, ao.failOnShadeError)
-            jarFilePool.withJar(jar) { jarFile =>
-              val shaded = jarFile.entries().asScala.filterNot(_.isDirectory).flatMap { entry =>
-                val entryName = entry.getName
-                shade(entryName, () => jarFilePool.stream(jar, entryName)).map { case (shadedName, stream) =>
-                  ShadeCache.Entry(entryName, shadedName, stream)
-                }
-              }
-              ShadeCache.write(cached, shaded)
+      throughShadeCache(cached, jar.getName) {
+        // One shader for the whole jar, which is safe because write reads the entries one at a time
+        val shade = shader(rules, log, ao.failOnShadeError)
+        jarFilePool.withJar(jar) { jarFile =>
+          val shaded = jarFile.entries().asScala.filterNot(_.isDirectory).flatMap { entry =>
+            val entryName = entry.getName
+            shade(entryName, () => jarFilePool.stream(jar, entryName)).map { case (shadedName, stream) =>
+              ShadeCache.Entry(entryName, shadedName, stream)
             }
-            ShadeCache.read(cached, jarFilePool, log)
-          } catch {
-            case e: IOException =>
-              log.warn(s"Shading ${jar.getName} without the shade cache, since $cached could not be written: $e")
-              None
           }
-      }
-      entries.map(_.map(entry => Library(module, entry.source, entry.target, entry.stream)))
+          ShadeCache.write(cached, shaded)
+        }
+      }.map(_.map(entry => Library(module, entry.source, entry.target, entry.stream)))
     }
 
     val jarFileEntries = timed(Level.Debug, "Collect and shade dependency entries") {
@@ -374,7 +427,7 @@ object Assembly {
     }
     ao.shadeCacheDirectory.foreach { dir =>
       log.debug(
-        s"Shade cache $dir: found ${shadeCacheHits.get} libraries, shaded and stored ${shadeCacheMisses.get}"
+        s"Shade cache $dir: ${shadeCacheHits.get} files found, ${shadeCacheMisses.get} shaded and stored"
       )
     }
 

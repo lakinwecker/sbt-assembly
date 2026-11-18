@@ -3,7 +3,7 @@
 > all a/assembly b/assembly
 > a/checkJar
 > b/checkJar
-> checkCachedLibraries
+> checkCached
 
 # b has nothing a didn't have, so assembling it again finds everything in the cache and writes nothing to it
 > recordCache

@@ -529,6 +529,10 @@ A cache file is named by a hash of the library JAR's bytes, the shade rules that
 rather than updating the old one. Nothing removes old files, so delete the directory now and then to reclaim the
 space. Several assemblies can use one directory at the same time, and it can be kept between CI runs.
 
+When a shade rule applies to your projects' own classes, they are cached the same way: one file per output
+directory, named by the paths and bytes of the files in it. Every build that changes a directory writes a new file
+for it, so this is what makes the directory grow fastest.
+
 With the cache on, the über JAR is written differently: an entry that comes from the cache unchanged is copied in
 still compressed, rather than inflated and compressed again. The JAR has the same entries with the same contents.
 

@@ -12,7 +12,7 @@ lazy val keepCopy = taskKey[Unit]("Copies the assembly aside")
 @transient
 lazy val checkSameAsCopy = taskKey[Unit]("Checks that the assembly has the same entries as the copy")
 @transient
-lazy val checkCachedLibraries = taskKey[Unit]("Checks that both libraries in lib/ were cached")
+lazy val checkCached = taskKey[Unit]("Checks that both libraries in lib/ and the project's classes were cached")
 @transient
 lazy val recordCache = taskKey[Unit]("Records the cache directory's files and their modification times")
 @transient
@@ -90,7 +90,7 @@ lazy val b = (project in file("b")).settings(appSettings)
 
 lazy val root = (project in file("."))
   .settings(
-    checkCachedLibraries := {
+    checkCached := {
       val files = IO.listFiles(cacheDir(baseDirectory.value)).toVector
       assert(!files.exists(_.getName.endsWith(".tmp")), s"temporary files were left behind: ${files.mkString(", ")}")
       // A cache file's entry comments start with the entry's name in the library
@@ -103,6 +103,7 @@ lazy val root = (project in file("."))
         sources.exists(s => s.contains("signed/Signed.class") && s.contains("META-INF/MANIFEST.MF")),
         "signed.jar was not cached"
       )
+      assert(sources.exists(_.contains("Main.class")), "the project's classes were not cached")
     },
     recordCache := IO.write(target.value / "cache-listing.txt", listing(cacheDir(baseDirectory.value))),
     checkCacheUnchanged := {

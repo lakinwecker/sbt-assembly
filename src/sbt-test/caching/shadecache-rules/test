@@ -14,3 +14,11 @@
 > assembly
 > checkShaded
 > checkCacheUnchanged
+
+# a changed class names a new cache file for the directory it is in
+> recordCache
+$ copy-file changes/Main.scala src/main/scala/Main.scala
+> set expectedOutput := "changed dup"
+> assembly
+> checkShaded
+> checkCacheGrew

@@ -19,7 +19,8 @@ import scala.util.control.NonFatal
  *
  * What shading a library produces depends only on the library's bytes, the shade rules that apply to it, whether a
  * shade error fails the build, and the version of the shading code. A cache file is named by a SHA-256 of all of
- * them, so a file is never updated in place: changing any of them names a different file.
+ * them, so a file is never updated in place: changing any of them names a different file. A directory of the
+ * project's compiled classes is cached the same way, keyed by the paths and bytes of its files.
  *
  * A cache file is a zip with one entry per shaded entry, stored under the numbered name `entries/<n>`, with the
  * entry's original and shaded names in its comment. Numbered names keep apart entries that share a name within one
@@ -71,30 +72,58 @@ private[sbtassembly] object ShadeCache {
     }.mkString(",")
 
   /** The cache file for `jar` shaded with `rules` */
-  def libraryFile(dir: File, jar: File, rules: Seq[ShadeRule], failOnShadeError: Boolean): File = {
-    val digest = MessageDigest.getInstance("SHA-256")
-    def add(value: String): Unit = {
+  def libraryFile(dir: File, jar: File, rules: Seq[ShadeRule], failOnShadeError: Boolean): File =
+    fileFor(dir, "library", rules, failOnShadeError)(add => add.file(jar))
+
+  /**
+   * The cache file for one directory of compiled classes and resources shaded with `rules`. Its name covers every
+   * file's path in the directory and its bytes, so it changes when anything in the directory does.
+   *
+   * @param files each file's path within the directory, and the file
+   */
+  def directoryFile(dir: File, files: Seq[(String, File)], rules: Seq[ShadeRule], failOnShadeError: Boolean): File =
+    fileFor(dir, "directory", rules, failOnShadeError) { add =>
+      files.sortBy(_._1).foreach { case (path, file) =>
+        add.string(path)
+        add.file(file)
+      }
+    }
+
+  private final class KeyBuilder(digest: MessageDigest) {
+    private val buffer = new Array[Byte](1 << 16)
+    def string(value: String): Unit = {
       digest.update(value.getBytes(UTF_8))
       digest.update(separator.toByte)
     }
-    add(formatVersion)
-    add(shaderJars)
-    add(failOnShadeError.toString)
-    rules.foreach(rule => add(rule.toString))
-    Using.fileInputStream(jar) { in =>
-      val buffer = new Array[Byte](1 << 16)
-      var read = in.read(buffer)
-      while (read >= 0) {
-        digest.update(buffer, 0, read)
-        read = in.read(buffer)
+    def file(file: File): Unit = {
+      Using.fileInputStream(file) { in =>
+        var read = in.read(buffer)
+        while (read >= 0) {
+          digest.update(buffer, 0, read)
+          read = in.read(buffer)
+        }
       }
+      digest.update(separator.toByte)
     }
+  }
+
+  private def fileFor(dir: File, kind: String, rules: Seq[ShadeRule], failOnShadeError: Boolean)(
+      addInputs: KeyBuilder => Unit
+  ): File = {
+    val digest = MessageDigest.getInstance("SHA-256")
+    val add = new KeyBuilder(digest)
+    add.string(formatVersion)
+    add.string(shaderJars)
+    add.string(kind)
+    add.string(failOnShadeError.toString)
+    rules.foreach(rule => add.string(rule.toString))
+    addInputs(add)
     new File(dir, digest.digest().map("%02x".format(_)).mkString + ".jar")
   }
 
   /**
    * The entries stored in `cached`, or None if it doesn't exist or can't be read. An unreadable file is treated as
-   * missing: the caller shades the library again, and the new file replaces it.
+   * missing: the caller shades again, and the new file replaces it.
    */
   def read(cached: File, pool: JarFilePool, log: Logger): Option[Vector[Entry]] =
     if (!cached.isFile) None
