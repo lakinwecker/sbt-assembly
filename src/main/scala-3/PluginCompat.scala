@@ -3,9 +3,10 @@ package sbtassembly
 import java.io.File
 import sbt.*
 import sbt.Keys.test
-import xsbti.FileConverter
-import sbtcompat.PluginCompat.{ Out, toFile, toOutput }
-import sjsonnew.BasicJsonProtocol
+import java.io.InputStream
+import java.nio.file.{ Files, Path as NioPath }
+import xsbti.{ BasicVirtualFileRef, FileConverter, HashedVirtualFileRef, PathBasedFile }
+import sbtcompat.PluginCompat.Out
 
 object PluginCompat:
   type JarManifest = PackageOption.JarManifest
@@ -40,21 +41,18 @@ object PluginCompat:
 
   val inTask = Project.inTask
 
-  private[sbtassembly] def cachedAssembly(inputs: CacheKey, cacheDir: File, scalaVersion: String, log: Logger)(
-      buildAssembly: () => Out
-  )(using conv: FileConverter): Out = {
-    import BasicJsonProtocol.given
+  /** The entry's content hash through sbt's own digest memo, which every task in this sbt shares */
+  private[sbtassembly] def contentDigest(entry: Attributed[HashedVirtualFileRef]): String =
+    sbt.util.CacheImplicits.hashedVirtualFileRefToStr(entry.data)
 
-    AssemblyCache.cachedAssembly[Out, String](inputs, cacheDir, scalaVersion, log)(
-      toCachedOutput = {  output =>
-        toFile(output).getAbsolutePath
-      },
-      fromCachedOutput = { path =>
-        toOutput(new File(path))
-      },
-      cachedOutputFile = { path =>
-        new File(path)
-      },
-    )(buildAssembly)
-  }
+  /** The jar as sbt's output, carrying the SHA-256 the plugin already has so that sbt doesn't read the jar again */
+  private[sbtassembly] def toOutputWithSha256(file: File, sha256: String)(using conv: FileConverter): Out =
+    val path = file.toPath
+    val ref = conv.toVirtualFile(path)
+    new BasicVirtualFileRef(ref.id) with PathBasedFile:
+      def contentHash: Long = ref.contentHash
+      def contentHashStr: String = "sha256-" + sha256
+      def sizeBytes: Long = Files.size(path)
+      def input(): InputStream = Files.newInputStream(path)
+      def toPath: NioPath = path
 end PluginCompat

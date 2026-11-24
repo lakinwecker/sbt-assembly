@@ -6,7 +6,7 @@ import sbt.Keys.*
 import sbt.Package.{ manifestFormat, JarManifest, MainClass, ManifestAttributes, FixedTimestamp }
 import sbt.internal.inc.classpath.ClasspathUtil
 import sbt.io.{ DirectoryFilter as _, IO as _, Path as _, Using }
-import sbt.util.{ FilesInfo, Level, ModifiedFileInfo }
+import sbt.util.Level
 import sbt.{ File, Logger, *}
 import sbt.Tags.Tag
 import CacheImplicits.*
@@ -277,6 +277,72 @@ object Assembly {
         val dir = toNioPath(dir0)
         (dir.toFile ** (-DirectoryFilter)).get().map(dir -> _.toPath)
       }
+    val moduleOf = (jar: Attributed[FileRef]) =>
+      jar.metadata
+        .get(moduleIDStr)
+        .map(parseModuleIDStrAttribute)
+        .map(m => ModuleCoordinate(m.organization, m.name, m.revision))
+        .getOrElse(ModuleCoordinate("", jar.data.name.replaceAll(".jar", ""), ""))
+    val (jarManifest, timestamp) = createManifest(po, log)
+    val outputRecordFile = AssemblyOutputCache.recordFile(cacheDir, ao.scalaVersion)
+    val strategyKey = (targets: Vector[String]) =>
+      AssemblyOutputCache.strategyKey(targets, targets.par.map(ao.mergeStrategy(_).cacheKey).seq.toVector)
+    lazy val inputKey = timed(Level.Debug, "Compute the input key") {
+      val key = new AssemblyOutputCache.InputKey
+      Seq(
+        ShadeCache.shaderJars,
+        Option(classOf[MergeStrategy].getProtectionDomain.getCodeSource).fold("")(_.getLocation.getPath),
+        targetJarName,
+        output.getAbsoluteFile.toPath.normalize.toString,
+        ao.includeBin.toString,
+        ao.includeScala.toString,
+        ao.includeDependency.toString,
+        ao.repeatableBuild.toString,
+        ao.failOnShadeError.toString,
+        ao.appendContentHash.toString,
+        ao.maxHashLength.toString,
+        ao.prependShellScript.toString,
+        timestamp.toString
+      ).foreach(key.add)
+      ao.shadeRules.foreach(rule => key.add(rule.toString))
+      val manifestBytes = new java.io.ByteArrayOutputStream
+      jarManifest.write(manifestBytes)
+      key.add(new String(manifestBytes.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
+      classByParentDir.groupBy(_._1).toVector.sortBy(_._1.toString).foreach { case (parentDir, files) =>
+        key.add("directory").add(parentDir.toString)
+        files
+          .map { case (parent, file) => parent.relativize(file).toString.replace('\\', '/') -> file.toFile }
+          .sortBy(_._1)
+          .par
+          .map { case (target, file) => target -> AssemblyOutputCache.memoizedSha256(file) }
+          .seq
+          .foreach { case (target, digest) => key.add(target).add(digest) }
+      }
+      val (externalJars, projectJars) = filteredJars.partition(externalDeps.contains)
+      (projectJars ++ externalJars).foreach { jar =>
+        key
+          .add(if (externalDeps.contains(jar)) "library" else "project jar")
+          .add(toNioPath(jar).getFileName.toString)
+          .add(moduleOf(jar).toString)
+          .add(contentDigest(jar))
+      }
+      key.hex
+    }
+    val previousRecord = if (ao.cacheOutput) AssemblyOutputCache.read(outputRecordFile) else None
+    if (ao.cacheOutput) {
+      val upToDate = timed(Level.Debug, "Check the recorded output") {
+        previousRecord
+          .flatMap(record =>
+            AssemblyOutputCache.upToDate(record, inputKey, strategyKey(record.targets))
+          )
+      }
+      upToDate match {
+        case Some(record) =>
+          log.info("Assembly jar up to date: " + record.output.toPath)
+          return toOutputWithSha256(record.output, record.outputSha256)
+        case None =>
+      }
+    }
     val jarFilePool = JarFilePool()
     val shadeCacheHits, shadeCacheMisses = new AtomicInteger
 
@@ -393,11 +459,7 @@ object Assembly {
     val jarFileEntries = timed(Level.Debug, "Collect and shade dependency entries") {
       val (externalJars, projectJars) = filteredJars.partition(externalDeps.contains)
       (projectJars ++ externalJars).par.map { jar =>
-        val module = jar.metadata
-          .get(moduleIDStr)
-          .map(parseModuleIDStrAttribute)
-          .map(m => ModuleCoordinate(m.organization, m.name, m.revision))
-          .getOrElse(ModuleCoordinate("", jar.data.name.replaceAll(".jar", ""), ""))
+        val module = moduleOf(jar)
         val jarPath = toFile(jar)
         val rules = rulesFor(module)
         // A library no rule applies to is copied as it is, so caching it would only add work
@@ -441,14 +503,13 @@ object Assembly {
       }
       // convert renames back to `Dependency`s for second-pass merge and cache-invalidation
       val renamedDependencies = convertToDependency(renamedEntries)
-      val (jarManifest, timestamp) = createManifest(po, log)
       // exclude renames from the second pass
       val secondPassMergeStrategy = (path: String) => {
         val mergeStrategy = ao.mergeStrategy(path)
         if (mergeStrategy.name == MergeStrategy.rename.name) Option.empty
         else Option(mergeStrategy)
       }
-      val buildAssembly: () => Out  = () => {
+      val buildAssembly: () => File = () => {
         val mergedEntries = timed(Level.Debug, "Merge all conflicting jar entries (including those renamed)") {
           merge(renamedDependencies ++ others, secondPassMergeStrategy, log)
         }
@@ -523,37 +584,34 @@ object Assembly {
           }
         log.info("Built: " + builtAssemblyJar.toPath)
         log.info("Jar hash: " + fullSha1)
-        toOutput(builtAssemblyJar)
+        builtAssemblyJar
       }
-      val mergeStrategiesByPathList = timed(Level.Debug, "Collect all merge strategies for cache check") {
-        // collect all
-        (renamedDependencies ++ others)
-          .groupBy(_.target)
-          .map { case (target, _) =>
-            val mergeStrategy = secondPassMergeStrategy(target).getOrElse(MergeStrategy.deduplicate)
-            target -> mergeStrategy.cacheKey.fold(false -> mergeStrategy.name)(true -> _)
-          }
+      if (!ao.cacheOutput) toOutput(buildAssembly())
+      else {
+        val targets = timed(Level.Debug, "Collect every entry name the merge strategy saw") {
+          ((classMappings ++ jarFileEntries.flatten).map(_.target) ++ renamedDependencies.map(_.target)).distinct.sorted
+        }
+        AssemblyOutputCache.delete(outputRecordFile)
+        previousRecord.foreach(record => Files.deleteIfExists(record.output.toPath))
+        strategyKey(targets) match {
+          case None =>
+            targets.iterator.map(ao.mergeStrategy).filter(_.cacheKey.isEmpty).map(_.name).toSet.foreach { (name: String) =>
+              // a custom merge strategy without a cache key could do anything, so its output can't be cached
+              log.warn(s"Caching disabled because of a custom merge strategy without a cacheKey: '$name'")
+            }
+            toOutput(buildAssembly())
+          case Some(strategyKey) =>
+            val built = buildAssembly()
+            val builtSha256 = timed(Level.Debug, "Hash the jar for the output cache") {
+              AssemblyOutputCache.sha256(built)
+            }
+            AssemblyOutputCache.write(
+              outputRecordFile,
+              AssemblyOutputCache.Record(inputKey, strategyKey, built, builtSha256, built.length, targets)
+            )
+            toOutputWithSha256(built, builtSha256)
+        }
       }
-      if (
-        ao.cacheOutput &&
-        !mergeStrategiesByPathList.values
-          .exists { case (cacheable, name) =>
-            // a custom merge strategy without a cache key could do anything, so its output can't be cached
-            if (!cacheable) log.warn(s"Caching disabled because of a custom merge strategy without a cacheKey: '$name'")
-            !cacheable
-          }
-      ) {
-        val (_, classes) = classByParentDir.unzip
-        val cacheKey = AssemblyCache.makeCacheKey(
-          classes.map(_.toFile()).toSet ++ filteredJars.map(toFile(_)).toSet,
-          mergeStrategiesByPathList,
-          jarManifest,
-          timestamp,
-          output,
-          ao,
-        )
-        cachedAssembly(cacheKey, cacheDir, ao.scalaVersion, log)(buildAssembly)
-      } else buildAssembly()
     } finally
       timed(Level.Debug, "Close library jar references") {
         log.debug(jarFilePool.stats)

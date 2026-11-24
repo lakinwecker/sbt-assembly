@@ -17,13 +17,8 @@ private[sbtassembly] object PluginCompat {
 
   val Streamable = scala.tools.nsc.io.Streamable
 
-  private[sbtassembly] def cachedAssembly(inputs: CacheKey, cacheDir: File, scalaVersion: String, log: Logger)(
-      buildAssembly: () => File
-  ): File = {
-    AssemblyCache.cachedAssembly[File, File](inputs, cacheDir, scalaVersion, log)(
-      toCachedOutput = identity,
-      fromCachedOutput = identity,
-      cachedOutputFile = identity
-    )(buildAssembly)
-  }
+  private[sbtassembly] def contentDigest(entry: Attributed[File]): String =
+    "sha256-" + AssemblyOutputCache.sha256(entry.data)
+
+  private[sbtassembly] def toOutputWithSha256(file: File, sha256: String): File = file
 }

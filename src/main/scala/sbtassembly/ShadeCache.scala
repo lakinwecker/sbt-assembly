@@ -59,7 +59,7 @@ private[sbtassembly] object ShadeCache {
    * The file names of the jars that hold the shading code. The names carry the versions, and another version of any
    * of them could shade the same input differently.
    */
-  private lazy val shaderJars: String =
+  private[sbtassembly] lazy val shaderJars: String =
     Seq(
       classOf[ShadeRule],
       classOf[com.eed3si9n.jarjar.util.EntryStruct],

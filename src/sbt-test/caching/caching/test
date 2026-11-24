@@ -38,6 +38,13 @@ $ delete src/main/resources/foo.txt
 > assembly
 > check
 
+# a newer modification time on inputs whose bytes are unchanged must not rebuild the jar
+> recordAssemblyMtime
+$ sleep 1100
+$ touch target/**/*.class
+> assembly
+> checkAssemblyNotRebuilt
+
 # a missing JAR must be recreated even when its inputs are unchanged
 > recordAssemblyMtime
 $ delete target/**/foo.jar

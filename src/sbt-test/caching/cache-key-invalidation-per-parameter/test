@@ -9,7 +9,7 @@
 
 # Each cache-key input must rebuild once, then return a cache hit on the next assembly.
 
-# Compiled class output (CacheKey.assemblyInputFileStamps)
+# Compiled class output
 > writeClass two
 > Compile/compile
 > assembly
@@ -18,7 +18,7 @@
 > assembly
 > checkAssemblyNotRebuilt
 
-# Processed resource output (CacheKey.assemblyInputFileStamps)
+# Processed resource output
 > writeProcessedResource two
 > assembly
 > checkAssemblyRebuilt
@@ -26,7 +26,7 @@
 > assembly
 > checkAssemblyNotRebuilt
 
-# Input JAR (CacheKey.assemblyInputFileStamps)
+# Input JAR
 > writeDependencyJar two
 > assembly
 > checkAssemblyRebuilt
@@ -34,7 +34,7 @@
 > assembly
 > checkAssemblyNotRebuilt
 
-# Built-in merge strategy for an actual conflicting entry (CacheKey.resolvedMergeStrategyInfoByTargetPath)
+# Built-in merge strategy for an actual conflicting entry
 > set cacheKeyMergeStrategy := "last"
 > assembly
 > checkAssemblyRebuilt
@@ -42,7 +42,7 @@
 > assembly
 > checkAssemblyNotRebuilt
 
-# Manifest (CacheKey.jarManifest)
+# Manifest
 > set cacheKeyManifestValue := "two"
 > assembly
 > checkAssemblyRebuilt
@@ -50,7 +50,7 @@
 > assembly
 > checkAssemblyNotRebuilt
 
-# Package.FixedTimestamp (CacheKey.fixedTimestamp)
+# Package.FixedTimestamp
 > set cacheKeyFixedTimestamp := 1234627000L
 > assembly
 > checkAssemblyRebuilt
@@ -59,7 +59,7 @@
 > assembly
 > checkAssemblyNotRebuilt
 
-# assemblyOutputPath (CacheKey.assemblyOutputPath)
+# assemblyOutputPath
 > set cacheKeyOutputName := "cache-key-relocated.jar"
 > assembly
 > checkAssemblyRebuilt
@@ -68,7 +68,7 @@
 > assembly
 > checkAssemblyNotRebuilt
 
-# assemblyRepeatableBuild (CacheKey.repeatableBuild)
+# assemblyRepeatableBuild
 > set assemblyRepeatableBuild := false
 > assembly
 > checkAssemblyRebuilt
@@ -76,7 +76,7 @@
 > assembly
 > checkAssemblyNotRebuilt
 
-# assemblyPrependShellScript (CacheKey.prependShellScript)
+# assemblyPrependShellScript
 > set assemblyPrependShellScript := Some(Seq("#!/usr/bin/env sh", "true"))
 > assembly
 > checkAssemblyRebuilt
@@ -84,7 +84,7 @@
 > assembly
 > checkAssemblyNotRebuilt
 
-# assemblyAppendContentHash (CacheKey.appendContentHash)
+# assemblyAppendContentHash
 > set assemblyAppendContentHash := true
 > assembly
 > checkAssemblyRebuilt
@@ -92,7 +92,7 @@
 > assembly
 > checkAssemblyNotRebuilt
 
-# assemblyMaxHashLength (CacheKey.maxHashLength)
+# assemblyMaxHashLength
 > set assemblyMaxHashLength := 7
 > assembly
 > checkAssemblyRebuilt
